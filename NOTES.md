@@ -690,3 +690,90 @@ RPMh/TCS write backend for Polaris in XNU, and composition is not permission to
 vote. Unknown rails and out-of-range corners are refused. Same refusals, same data
 and the same "no write API" rule as the host tool `tools/polaris_rpmh_vote.py`,
 which has 8 tests including a scan for any write/send helper.
+
+### 2026-10-28 GPU diagnostic review: correct the premises before a powered backend
+
+User confirmed the failing target is MIX 2S iOS/XNU and supplied
+`D:\ios\adreno-630-gpu-driver`. Inspection confirmed that checkout is an Android
+9/10 Magisk userspace-library package (v331/v415); sampled GLES libraries are ELF
+AArch64, and there are no C/H sources or fw/bin/mdt firmware files. The saved
+`D:\ios\ring-decoded.txt` lines 94-96 stop after handoff validation at the missing
+rails backend. That earlier ring does not validate 0096; 0096 still sends nothing.
+
+**New source-backed corrections; supersede the earlier composition/routing claims:**
+
+- 0096 and `tools/polaris_rpmh_vote.py` conflate ARC consumer levels, hardware
+  selectors and VRM voltage requests. MiCode Polaris `rpmh-regulator.c` uses the
+  ARC selector as the request data and preserves AUX array indices including OFF;
+  VRM voltage data is in millivolts. The current combination of `vrm.*` addresses
+  and `*.lvl` consumer-level values must not become a write path. Existing
+  composer tests encode this same mistaken assumption and do not validate it.
+- The first cell in DT `iommus = <0x208 0x0>` is a provider **phandle**, not SID
+  0x208. `SID_MAP`, 0095's table and the handset facts document incorrectly label
+  these cells as SID/context-bank. The remaining specifier must be interpreted
+  through the referenced provider's `#iommu-cells` and the vendor SMMU binding;
+  no context-bank assignment is established by the tuple alone.
+
+Evidence, pinned primary-source references and the ordered implementation plan are
+in `docs/POLARIS-GPU-NEXT-STEPS.md`. Vendor source revision:
+`c7cb50c18f812629b9620b2b8fa684bc40d82080`; upstream Linux cross-check:
+`65ba8f34ec886ec72b2c07ddc8cf3d815c32869d`. No source code was copied from Linux.
+
+Next concrete work: correct the offline request model and phandle/specifier
+parsing with semantic regression tests; then implement the owned RPMh/TCS,
+rails/clocks/bandwidth backend. Subsequently validate restricted SMMU, GMU/HFI,
+PAS13, a changed sentinel plus completed fence, and only then userspace graphics.
+This review changes documentation only: no runtime/driver fix, CI dispatch, device
+test, reboot, flash or MMIO. GPU acceleration remains unavailable.
+
+### 2026-10-28 (device): 0095+0096 gate executed on the handset
+
+CI [40660689433](https://github.com/QZzwj/ios16_on_polaris_mix2s/actions/runs/40660689433)
+`success` on `553fc3c55`: the build log lists 0094/0095/0096 in the patch set and
+compiles `polaris_gpu_validate.o`, `polaris_gpu_arc.o` and `polaris_gpu_arc_vote.o`
+with no new diagnostics (only the pre-existing `-Wmissing-prototypes` on
+`polaris_gpu_diag` and `polaris_gpu_init`). Kernel 12,302,016 B,
+sha256 `7fc9c788b52782fa1fe54c8ce3b131bdee1ec3fcc93bdde0f26cc10400a8e257`, matching
+the artifact's own SHA256SUMS.
+
+Temporary `fastboot boot` of `D:\ios\gpu-test\boot-gpu-handoff-test.img`
+(18,141,184 B, sha256 `acbd7cd7…58486`: that CI kernel + payload 11,839,360 B with
+the corrected 32 KiB GMU), then recovery for a read-only ring pull
+(`ring total 340986 B, flush #104`):
+
+```
+POLARIS GPU: invalid GPU-SQE range; no GPU access                     (0091, expected)
+POLARIS GPU: handoff validated set=miui-v12.5.1.0-qdgcnxm-20210707
+  (vendor.img of the official ROM, read back from the device)
+  dram=0x100000000+0x7cc00000 sqe@0x101ffc000
+POLARIS GPU: pinned cmd-db rows=10 (gfx.lvl=9 indices), SID maps=5; nothing mapped or voted
+POLARIS GPU: dry-run vote vrm.cx  corner 0 -> addr 0x40800 data 0x10; corner 6 -> data 0x180 (nothing written)
+POLARIS GPU: dry-run vote vrm.mx  corner 0 -> addr 0x40700 data 0x10; corner 3 -> data 0x180 (nothing written)
+POLARIS GPU: dry-run vote vrm.gfx corner 0 -> addr 0x42700 data 0x10; corner 8 -> data 0x1a0 (nothing written)
+POLARIS GPU: rails backend not implemented; no hardware access
+POLARIS GPU: acceleration unavailable; CPU display unchanged
+```
+
+Same ring: `SWEET CPU: requested=8 selected=8 (limit=8)` and
+`8/8 CPUs initialized, SGI1 verified`. No panic; the boot reached userspace.
+
+So the handoff validation, the pinned command-DB rows and the rail-vote composition
+all execute correctly on the device. Nothing was powered, mapped or voted: the gate
+still returns false at `rails`.
+
+### 2026-10-28: why the screen does not fill (measured, not guessed)
+
+Same ring:
+
+```
+SWEET FB: AppleCLCD 1080x2160 stride 4320 at 0x9d400000, default surface 1, presented as 1125x2436
+SWEET FB: scaling to 998x2160 content at 41,0
+```
+
+The panel is 1080x2160 while iOS presents 1125x2436; patch 0082's `sweetfb_polaris`
+branch fits the whole logical display by height, giving 998x2160 with 41-pixel side
+bars. That is a deliberate aspect-preserving choice, not a fault. The scaling loop
+already computes X and Y steps independently, so a "fill" mode is a small change:
+an opt-in boot argument that sets `fContentW=fWidth`, `fContentH=fHeight`,
+`fOffX=fOffY=0`, `fScale=1` (stretch, ~8% vertical). Do not make it the default
+without the owner's say-so, and do not confuse it with GPU composition.
