@@ -835,3 +835,337 @@ the existing sandbox escalation. Use `ci.py detail` / `download`,
 `package_0099.py`, then explicit `device_0099.py` actions; never run the old
 unattended `staging/auto_0097.py`. Recovery was copied locally, SHA256
 `a7800ebe2393531b4484ba2a17f123d19b0c9cd842cab269c4205079f8f5b83b`.
+
+### 2026-10-28 follow-up: concurrent power-offset regression and patch collision
+
+User confirmed this session should own device operations and will pause the other
+session. This session still has not booted, rebooted or flashed the handset.
+
+- Isolated CI `40673733146` attempt 1 never acquired a hosted runner; annotations
+  report capacity constraints. Attempt 2 was explicitly cancelled by `QZzwj`.
+  Concurrent main run `40675373989` snapshots remote `4e033828...`, equivalent
+  to local `f0c7b13`; that snapshot must not be booted as the repaired image.
+- Concurrent commit `fceae97` introduced a second **0099** for framebuffer fill.
+  Kept all framebuffer changes and their dependency order, renaming fill to
+  **0100** and column map to **0101**; GPU protocol remains **0099**.
+- Concurrent warning cleanup `f0c7b13` changed register constants from mapped-page
+  offsets to GPUCC-base offsets but kept mapping at GPUCC+0x1000. This would
+  read/write the wrong registers (+0x1000 twice), including the CX power request.
+  New **0102** forward patch derives every offset as documented GPUCC offset
+  minus the mapped-page offset: effective CX 0x0509106c, HW_CTRL 0x05091540,
+  GX 0x0509100c. It does not change power opt-ins or establish ownership.
+- Added 3 native-C RAM-window tests to the existing shipped-patch fixture.
+  Two failed before the fix, reading poison `0x5a5a5a5a` and taking the timeout
+  path instead of detecting foreign-powered CX. After 0102, all **89** tests
+  pass (82 Python + 7 compiled C). Checks cover exact mapping, all three
+  physical register values, unchanged memory for read-only/foreign-owned state,
+  and no mapping without both the board gate and separate opt-in. No actual
+  GPUCC MMIO was used by these tests. Forward/reverse/forward of 0102 verifies.
+
+Next build the full 0001-0102 tree. Keep `polarisgpuon=0`; a real GPU execution
+and iOS renderer are still missing. The isolated packaging/device helpers remain
+usable after replacing their recorded CI source with the new exact snapshot.
+
+0102 milestone: local commit `0b160e476828ec89f6837049ee2f489afb99fee0`,
+102 contiguous patches validated; the complete framebuffer source reconstructs
+from the patch series with fill before column mapping. Isolated fork branch
+`polaris-gpu-fixes-0102-0b160e47`, remote commit
+`43d98dab531e81913380c4b722bb5da1b90d89ec`, exact tree
+`f3145f594b47b81fda5ae6201033d8952f2b60f6`. CI `40677321846` has acquired a
+runner and passed `Verify GPU protocol regressions`; full kernel build is in
+progress, not yet a kernel success. The previous main run already failed, so no
+cancellation was performed by this session. Use the updated helpers
+`gpu-fix/package_0102.py` and `gpu-fix/device_0102.py` for this source record.
+
+### 2026-10-28 11:24 UTC: 0102 built and temporarily booted; runtime unverified
+
+CI `40677321846` concluded **success**, including regressions and full XNU
+compile/link. Kernel 12,269,256 B, SHA256
+`1a89190056f70c7fa8a835d0c0201d26e50185c675ec370c8d0227bc21109e3e`, matching
+the artifact's `SHA256SUMS`. Whole-archive `gh run download` stalled; kernel and
+checksums were extracted via official Azure HTTPS ranges, with ZIP CRC and the
+extracted SHA256 verified (the full 53 MB archive digest was NOT verified).
+`gh` full-log retrieval is still pending; do not claim log diagnostics reviewed.
+
+Repacked image `D:\ios\gpu-fix\boot-polaris-0102-temporary.img`, 18,141,184 B,
+SHA256 `18e45bc35e41791ed4e9dcd308a01ec9eb09333e6fe4909b783dfc9e060e4fb5`.
+Payload 11,839,376 B with 2,750,576 B remaining below the ABL boundary. Independent
+unpack verifies Android header, exact boot command line, six firmware memory-map
+allocations/content hashes and final image hash. Uses `polarisgpuon=0`,
+`polarisgpupwr=1`, eight CPUs and existing display/touch settings; fill remains
+opt-in and unset. No permanent partition flashing.
+
+At **11:24:09 UTC**, checked a unique `product=polaris` and ran only temporary
+`fastboot boot`: Sending and Booting both **OKAY**. That proves bootloader
+acceptance, not successful XNU startup or graphics. User has been asked to report
+the screen and hold ~3 minutes for persistent log flush. Next have the user return
+to FASTBOOT, temporarily boot the pinned local recovery with `device_0102.py
+recovery`, read the ring with `ring`, and establish fresh 0099/0102 markers before
+making runtime claims. Local serial-bearing device record/dumps stay out of git.
+
+11:32 UTC handoff: still no FASTBOOT target after the temporary boot; no runtime
+ring has been read. Two asynchronous requests are pending (screen state and
+manual Power+VolumeDown return to FASTBOOT). Do not infer either successful iOS
+startup or a crash from the absent USB target. GH metadata confirms the successful
+build, but full log downloads via `gh run view --log`, `gh api .../logs` and the
+official signed log service stalled/timed out; compile diagnostics have not been
+reviewed. Kernel/image integrity checks above did succeed. No permanent flashing
+is appropriate while runtime remains unverified, and GPU acceleration is absent.
+
+### 2026-10-29: 0102 runtime captured; GPU remains unavailable; 0103 source repair
+
+User confirmed the temporary 0102 image entered iOS and the handset had returned
+to FASTBOOT. Checked the same unique Polaris against the local serial record and
+temporarily booted the pinned recovery (Sending/Booting OKAY). Through recovery
+ADB read only the last 1025 * 4096 bytes of userdata; no partition flash. Local
+ring `D:\ios\gpu-fix\ring-0102-local.bin` is 4,198,400 B, SHA256
+`f9f6e3427d6ae0ad02b08ef5f8d94d853d0f396f8c14a56279f1782213f605a0`.
+Decoded `ring-0102-decoded-local.txt`: version 1, total 1,198,233 bytes, flush #4941.
+Dump, decoded userspace log and serial-bearing records stay outside git.
+
+Observed in this ring:
+
+- 8/8 CPUs initialized, SGI1 verified; userspace creates framebuffer surfaces,
+  swaps them and reaches the 1000-swap marker. User independently observed iOS.
+- The corrected ARC output includes gfx.lvl 10 selectors with OFF and max
+  level 0x1a0 selector/data 9 at 0x30050. These establish execution of 0099;
+  they alone do not uniquely fingerprint 0102. Attribution also uses the exact
+  recorded build/image and boot record.
+- Read-only GPUCC CX GDSCR **0x00222001**, CX HW_CTRL **0x00005ff4**,
+  GX GDSCR **0x00222001**. The tested mapping places these at 0x0509106c,
+  0x05091540 and 0x0509100c. No vote, GDSC write or domain ownership is proven.
+- Explicit `rails backend not implemented` followed by
+  `acceleration unavailable; CPU display unchanged`. There are 302 zero-result
+  IOAcceleratorES matches. No `panic(cpu` substring in the captured ring; this
+  does not establish indefinite stability. **No GPU acceleration, no FPS claim.**
+- The earlier `invalid GPU-SQE range` message comes from 0091's hardcoded
+  32136-byte historical length; 0094 then validates the actual registered MIUI
+  set (31980-byte SQE). It is a contradictory diagnostic, not the rails blocker.
+
+Forward **0103-polaris-gpu-shared-handoff-diagnostic.patch** replaces 0091's
+duplicate metadata validator with pg_validate_handoff(), retaining its independent
+board/opt-in gates and no MMIO. Both registered length vectors get the same bounds,
+overlap and reserved-region checks as bring-up. Firmware hashes remain packaging
+checks, not runtime authentication. It also removes the unconditional call from
+polaris_gpu_init() to the standalone 0098 CX experiment: even setting both power
+flags cannot bypass the missing owned rails backend. The 0098 function itself and
+all prior patches are preserved. This repair **does not implement power or GPU**.
+
+Extended native fixture to compile and execute actual diag, validator and init C
+from patches with unaligned fake ADT properties. Two tests fail on reconstructed
+0102 (official-set false refusal and unexpected CX experiment call), then pass
+with 0103. All **95** regressions pass (82 Python + 13 compiled C) with Zig 0.13.0,
+-Wall -Wextra -Werror. Tests cover opt-in/board before ADT, both sets, malformed/
+missing lengths, overlap/alignment, managed RAM bounds/overflow, reserved RAM and
+the unchanged RAM-window power registers. Full 0103 XNU build/phone test pending.
+
+After saving the ring, at **2026-10-29 01:36:00 UTC** used recovery's reboot to
+bootloader, checked same Polaris, rechecked 0102 image SHA256
+`18e45bc35e41791ed4e9dcd308a01ec9eb09333e6fe4909b783dfc9e060e4fb5`,
+and temporarily booted that same user-validated image. Sending/Booting OKAY;
+the return boot's screen is not yet observed. No permanent flashing, no 0103
+image was packaged/booted. Local helper `return_ios_0102.py` records this separate
+return boot without overwriting the original test record.
+
+Next implement the real Polaris RPMh/TCS rail backend with ownership and ACK,
+GPUCC clocks/bandwidth, then SMMU before GMU/DMA, HFI/PAS13 and CP sentinel/fence;
+only later iOS graphics integration. Do not enable polarisgpuon or flash a
+diagnostic as a performance fix. Local boot DTB confirms apps RSC DRV 2 uses
+0x179e0000 + TCS offset 0xd00 with ACTIVE 2 / SLEEP 3 / WAKE 3 / CONTROL 1;
+static DT is not runtime ownership. Never transplant Sweet's 0x18220000/ldoc11
+RPMh helper to Polaris. Full CI logs still unreviewed: the existing 433342-byte
+ci-0102-logs.zip is a truncated ZIP without central directory, not verified logs.
+
+0103 source milestone committed as `160f3feadf60f6dbb15431a7c5d13b74e759e168`.
+103 unique contiguous patches and all 49 Python tools validate. 0103 forward/
+reverse/forward apply succeeded on reconstructed source; resulting C passes the
+whitespace check (space-prefixed context lines inside a .patch are required diff
+syntax, not C indentation errors). No new CI dispatch or 0103 phone boot in this
+milestone. The remaining GPU backend work above is not complete.
+
+### 2026-10-29: user-supplied Android OpenCL article reviewed against local ELF
+
+User pasted the full 2022-06-06 article about reproducing Metal's array-add
+example using Android OpenCL, dlopen/dlsym and an existing vendor runtime. It is
+not a Metal implementation or an XNU kernel GPU backend. Checked Apple Metal
+sample/dlopen primary docs, Android Bionic overview and AOSP libdrm KGSL source;
+native Darwin dlopen expects Mach-O, whereas the vendor package is Android ELF.
+
+Read-only ELF64 inspection (no library execution) of Android-10 libgsl,
+libGLESv2_adreno, libEGL_adreno and vulkan.sdm845 reports AArch64 and Android
+DT_NEEDED dependencies including libcutils/liblog. libgsl imports ioctl/mmap/
+mmap64/property_get and embeds /dev/kgsl-3d0 and /dev/ion. These are static evidence,
+not an execution trace. No file whose name contains OpenCL exists in that package.
+Detailed local JSON and reproducible script: gpu-fix/android-gpu-libs-local.json
+and inspect_android_gpu_libs.py. No phone, image, CI or source patch change in
+this review; 0103 remains locally validated but not full-XNU-built/phone-tested.
+
+Recorded applicability in docs/POLARIS-GPU-NEXT-STEPS.md. Reuse the array-add
+idea only after actual headless CP proof; do not add a loader wrapper and report
+GPU acceleration. ELF/Bionic and KGSL ABI adaptation would itself be substantial
+work and would still require the missing hardware backend and iOS integration.
+
+### 2026-10-29: 0104 RPMh build, silent patch-skip incident, temporary image
+
+CI run **40820200192** on branch `polaris-gpu-fixes-3816ca34` succeeded for
+remote commit `7a6b6383900bfbc17dba67a9649e71fe8d8e96f7` (local
+`3816ca342b83e9e69b81cb411608326d4dbb0df0`). It produced the kernel used for
+the first RPMh read-only probe:
+
+- `kernel.release.sweet`, 12,318,376 B, SHA256
+  `a1560eefc375e7e9da5814d5fed44f6b9e9d5a1e5c7cc96b9446ebdd77740d79`.
+  Strings contain `POLARIS RPMH` x8, `DRV2@0x179e0000`, `observation only`,
+  `unreadable DRV2` and `gfx.lvl=10 selectors including OFF`.
+- Temporary image `boot-polaris-0104-temporary.img`, 18,141,184 B, SHA256
+  `28a4f77aaeeef4db88d5e290766c8f32937b9302fe0288be4c39caba09f37e6f`,
+  payload 11,839,344 B, 2,750,608 B left below the ABL load limit. The boot
+  command line enables `polarisgpudiag=1 polarisgpu=1 polarisgpupwr=1
+  polarisrpmhdiag=1` and keeps `polarisgpuon=0`.
+
+The first run **40809778516** reported success but was not a valid 0104 build:
+its log showed both `0103` and `0104` being skipped as "already upstream,
+previously applied, or malformed", and the artifact contained no RPMh code.
+Root cause: the reconstructed baseline omitted one line that patch 0092 adds to
+`polaris_gpu_diag.c`, so the 0103/0104 context did not match. The exact
+`xnu-buildtree` artifact from that run was extracted and both patches were
+regenerated against it. Forward/reverse/forward application then passed on a
+clean baseline, and all **117** regressions pass (82 Python plus actual compiled
+C fixtures, Zig 0.13.0, `-Wall -Wextra -Werror`).
+
+The 0104 adapter installs only a read callback after mapping
+`0x179e0000..0x179e3fff`; it installs no write, timer or authority callback, so
+no boot argument can make it send an ARC vote. The image manifest records
+`gpu_acceleration:false`, `gpu_power_write_optin:false` and
+`rpmh_write_path_wired:false`. This is still observation only: a successful
+snapshot will establish register geometry, not ownership of inherited ARC
+votes, and must not be described as GPU acceleration.
+
+At **2026-10-29 05:52 UTC** the image was temporarily booted on the same Polaris
+(`fastboot boot`, no partition write) and the persistent ring was read through
+the pinned recovery. Ring flush #12, 219,035 bytes. The probe printed:
+
+- `POLARIS RPMH: DRV2@0x179e0000 TCS+0xd00 config=0x80008104 banks=8 ncpt=16 result=0`
+- `POLARIS RPMH: IRQ enable=0x1 status=0x0 (read-only)`
+- all eight TCS banks `idle=0x1 control=0x0 enable=0x0 wait=0x0`, including
+  ACTIVE0/ACTIVE1; no enabled command was present.
+
+This confirms the Polaris APPS DRV2 register base, TCS offset, 8-bank/16-command
+geometry and a quiescent TCS on hardware. It does **not** prove ownership of
+inherited ARC votes and does not send a vote; the ring still ends with
+`POLARIS GPU: acceleration unavailable; CPU display unchanged`. The read-only
+helper `gpu-fix/device_0104.py` pinned the image hash, refused any write-path
+manifest, booted only temporarily, and wrote `ring-0104-summary-local.json`
+without putting serials in git. GPU acceleration remains off until a separately
+gated, owned rail vote is implemented and proven.
+
+### 2026-10-29: 0105 single-shot gfx.lvl vote (host validation)
+
+0105 adds a separately opted-in write path to the APPS DRV2 adapter. The default
+boot path still installs only a read callback. With `polarisrpmhdiag=1
+polarisrpmhvote=1 polarisrpmhlevel=0..9` the adapter claims the transport once,
+re-checks that all eight TCS banks are idle and empty with IRQ status clear,
+sends exactly one `gfx.lvl` command (never `cx.lvl`/`mx.lvl`), then takes a
+post-vote snapshot. Any timeout or uncertain mutation quarantines the transport
+until reboot and is never retried. Level 0 is the GPU-off selector; this path
+does not touch GPUCC, GDSC, SMMU or the GPU and is not GPU acceleration.
+
+The host fault-injection suite passes all **122** tests after adding adapter
+coverage for the observation path, dirty/stale state refusal, a successful
+single ACK with TCS cleanup, and timeout quarantine without retry. The simulated
+DRV2 is not hardware: these tests prove the command/ACK state machine and
+cleanup logic, not that the phone accepts a vote. The CI kernel and temporary
+image still need device validation, again via `fastboot boot` only; no partition
+is written.
+
+The first 0105 CI run **40827204460** failed at the real XNU compile:
+`polaris_rpmh.c:83: too few arguments to function call, expected 2, have 1`.
+The host fixture had declared `absolutetime_to_nanoseconds(uint64_t)` returning
+a value, while the kernel API is
+`void absolutetime_to_nanoseconds(uint64_t, uint64_t *)`. The adapter now calls
+the real API and the fixture declares the same prototype, so this mismatch can
+no longer pass host tests. Patch 0105 was regenerated (LF, 8,903 bytes) and all
+122 regressions pass. A new CI build is required before any 0105 image is
+packaged; GPU acceleration remains off.
+
+
+### 2026-10-29: 0105 CI success and device results (no GPU)
+
+CI run **40829091993** on branch `polaris-gpu-fixes-9b4d58b7` succeeded for
+remote commit `4bcc90de26016288bedd0e649dd7f08efc7b7c69` (local
+`9b4d58b799f37472f85b5e4e7c14744996c158cc`). It produced
+`kernel.release.sweet`, 12,318,384 B, SHA256
+`ea390585c172eab5026ceb7f840f7b0f7a04da95fd2314f6a78c0f61bbebf326`.
+Two temporary images were packaged with `polarisgpuon=0`:
+
+- regression, `boot-polaris-0105-regression.img`, 18,141,184 B, SHA256
+  `0f0268d8c6cfb6df4b9a457c9a15b4666a6913f7635e42436f0d76566cd6f2a4`,
+  cmdline ends `polarisrpmhvote=0`.
+- vote, `boot-polaris-0105-vote-lvl0.img`, 18,141,184 B, SHA256
+  `6d9aba03c79eb8c781796d299ef24baae2ec7b1e7790b6d0bce572d9ab13423c`,
+  cmdline ends `polarisrpmhvote=1 polarisrpmhlevel=0`.
+
+Both were only temporarily booted with `fastboot boot`; no partition was
+written. The regression ring (flush #17, 209,615 B, SHA256
+`31e0740734175c9c6c6f900daed38094ad0e41c1324d7ba000eb539b63b91a2a`)
+still reports `DRV2@0x179e0000 TCS+0xd00 config=0x80008104 banks=8 ncpt=16
+result=0`, all eight TCS banks idle/empty, the ten `gfx.lvl` selectors through
+OFF/`0x1a0`, and `observation only; no lease, no ARC vote, no GPU power`.
+This establishes that 0105 did not regress the read-only path.
+
+The vote ring (flush #67, 227,348 B, SHA256
+`05e60fbe2a4f032136557c3c0b06e68f9ecd0908b20ff64aa6dd08dd0f1bcc4f`)
+contains the single attempted command:
+
+- `POLARIS RPMH: vote opt-in level=0; single-shot gfx.lvl only`
+- `POLARIS RPMH: gfx.lvl selector=0 addr=0x30050 data=0x0 result=4`
+- `POLARIS RPMH: vote did not ACK; transport quarantined=1`
+- `POLARIS RPMH: vote result=4; no GDSC/clock/SMMU/GPU access`
+
+`result=4` is `PG_RH_TIMEOUT`: the command was written in the selected ACTIVE
+TCS, but the completion status/IRQ did not arrive before the 10 ms deadline.
+There is no `post-vote` line because completion never permitted cleanup. The
+transport stayed quarantined until reboot and was not retried. This proves the
+boot path can reach the write attempt, but it does **not** prove a TCS write,
+ACK, gfx rail ownership, voltage/clock bring-up, or GPU execution. The display
+remained CPU-composited (`SWEET FB` swaps, no GPU acceleration).
+
+Next diagnostic must explain the missing completion without retrying the same
+vote: read back the target ACTIVE TCS `STATUS`, `CONTROL`, `ENABLE`, `WAIT`,
+`MSGID`, `ADDR`, `DATA`, `CMD_STATUS`, and DRV `IRQ_ENABLE`/`IRQ_STATUS` after
+the timeout, and compare the trigger/enable sequence with the documented
+AOSP RPMh RSC ordering. Do not switch to level 9 or touch GPUCC/GDSC until the
+completion path is understood.
+
+### 2026-10-29: 0106 device vote ACK (completion path works; still no GPU)
+
+CI run **40835278404** on branch `polaris-gpu-fixes-71a6659d` succeeded for
+remote commit `94bd55a7cda4d672303a3f84f2530f47a0404807` (local `71a6659`).
+The kernel is `kernel.release.sweet`, 12,318,384 B, SHA256
+`bdd9d118911e10abefd53ac3779f9c0e7f7c382b750017e1a67d8a22e9be3887`.
+The vote image `boot-polaris-0106-vote-lvl0.img` (18,141,184 B, SHA256
+`03c3156ef2188982a65201a8ff631dfc7f9a70e3e80c6e182492cdf7f290fd20`) was only
+temporarily booted with `fastboot boot`; no partition was written. It carried
+`polarisgpuon=0` and `polarisrpmhvote=1 polarisrpmhlevel=0`.
+
+The vote ring (4,198,400 B, SHA256
+`e24ac0813d561d1aabd7740b7f97de0777cebf7bd1f818cecd9492b549cbf403`) contains:
+
+```
+POLARIS RPMH: DRV2@0x179e0000 TCS+0xd00 config=0x80008104 banks=8 ncpt=16 result=0
+POLARIS RPMH: IRQ enable=0x1 status=0x0 (probe)
+POLARIS RPMH: vote opt-in level=0; single-shot gfx.lvl only
+POLARIS RPMH: gfx.lvl selector=0 addr=0x30050 data=0x0 result=0
+POLARIS RPMH: post-vote IRQ status=0x0 ACTIVE0 idle=0x1 control=0x0 enable=0x0 wait=0x0
+POLARIS RPMH: vote result=0; no GDSC/clock/SMMU/GPU access
+```
+
+`result=0` is an ACK: leaving the firmware-enabled ACTIVE completion IRQ alone
+fixes the 0105 timeout. The trigger, completion, payload cleanup and IRQ status
+clear all completed, and the TCS was left idle. This validates the transport only.
+Level 0 is the gfx OFF selector; `polarisgpuon=0` keeps every GPUCC/GDSC write
+disabled, `POLARIS GPU: rails backend not implemented` still follows, and the
+display remained CPU-composited (`SWEET FB` swaps, no GPU acceleration).
+
+Next is 0107: replace the absent rails stage with one controlled, reversible CX
+GDSC request behind its own opt-in, with full readback and no retry. It must not
+raise `gfx.lvl` and must not touch GX/SMMU/GMU.
