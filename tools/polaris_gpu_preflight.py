@@ -16,6 +16,25 @@ from polaris_gmu_firmware import check_flat_a630_gmu
 PAGE = 0x4000
 ZAP_BASE, ZAP_SIZE = 0x8c415000, 0x2000
 SPLASH_BASE, SPLASH_SIZE = 0x9d400000, 0x2400000
+CAMERA_BASE, CAMERA_SIZE = 0x8bf00000, 0x500000
+IPS_BASE, IPS_SIZE = 0x8c400000, 0x10000
+IPA_BASE, IPA_SIZE = 0x8c410000, 0x5000
+ADSP_BASE, ADSP_SIZE = 0x8c500000, 0x1e00000
+WLAN_BASE, WLAN_SIZE = 0x8e300000, 0x100000
+# The HFI table must sit in the free hole between gpu_region
+# (0x8c415000+0x2000) and adsp_region (0x8c500000). The old 0x8bf80000
+# candidate was inside camera_region (0x8bf00000+0x500000), whose XPU
+# protection made the first table write fault.
+HFI_BASE, HFI_SIZE = 0x8c420000, 0x8000
+PLATFORM_RESERVED = (
+    ('camera', CAMERA_BASE, CAMERA_SIZE),
+    ('ips_fw', IPS_BASE, IPS_SIZE),
+    ('ipa_gsi', IPA_BASE, IPA_SIZE),
+    ('gpu_region', ZAP_BASE, ZAP_SIZE),
+    ('adsp', ADSP_BASE, ADSP_SIZE),
+    ('wlan_fw', WLAN_BASE, WLAN_SIZE),
+    ('splash', SPLASH_BASE, SPLASH_SIZE),
+)
 MAX_PAYLOAD_SIZE = 0x1dea000 - 0x1000000
 BLOBS = (
     ('GPU-SQE', 'a630_sqe.fw'), ('GPU-GMU', 'a630_gmu.bin'),
@@ -126,7 +145,7 @@ def overlap(base, size, other, other_size):
     return base < other + other_size and other < base + size
 
 
-def check_layout(kernel, tree, cmdline, files):
+def check_layout(kernel, tree, cmdline, files, hfi=None):
     raw = tree.read_bytes()
     root, end = adt.parse(raw)
     if end != len(raw):
@@ -136,12 +155,24 @@ def check_layout(kernel, tree, cmdline, files):
                   for n in ('dram-base', 'dram-size'))
     if not size or base + size > 1 << 64:
         raise ValueError('invalid XNU managed RAM range')
-    for label, addr, length in (('zap', ZAP_BASE, ZAP_SIZE),
-                                ('splash', SPLASH_BASE, SPLASH_SIZE)):
+    for label, addr, length in PLATFORM_RESERVED:
         if overlap(base, size, addr, length):
             raise ValueError(f'XNU managed RAM overlaps {label} reserved memory')
+    entries = ()
+    if hfi is not None:
+        hfi_pa, hfi_size = hfi
+        if hfi_size < HFI_SIZE or hfi_pa & (PAGE - 1) or \
+                hfi_pa + hfi_size > 1 << 32:
+            raise ValueError('GPU-HFI reservation is not a usable low-DRAM range')
+        if overlap(base, size, hfi_pa, hfi_size):
+            raise ValueError('GPU-HFI reservation overlaps XNU managed RAM')
+        for label, addr, length in PLATFORM_RESERVED:
+            if overlap(hfi_pa, hfi_size, addr, length):
+                raise ValueError(f'GPU-HFI reservation overlaps {label}')
+        entries = (('GPU-HFI', hfi_pa, hfi_size),)
     image, _ = mkpayload.build(kernel, tree, cmdline,
-                                blobs=[(name, str(files[name][0])) for name, _ in BLOBS])
+                                blobs=[(name, str(files[name][0])) for name, _ in BLOBS],
+                                memory_map_entries=entries)
     if len(image) > MAX_PAYLOAD_SIZE:
         raise ValueError(f'payload {len(image)} exceeds ABL gap {MAX_PAYLOAD_SIZE}')
     adt_off, adt_size = struct.unpack_from('<2Q', image, 0x20)
@@ -161,6 +192,15 @@ def check_layout(kernel, tree, cmdline, files):
         if any(overlap(addr, reserved, a, s) for a, s in intervals):
             raise ValueError(f'overlapping firmware allocations: {name}')
         intervals.append((addr, reserved))
+    if hfi is not None:
+        value = memory_map.prop('GPU-HFI')
+        if value is None or len(value) != 16:
+            raise ValueError('missing ADT entry: GPU-HFI')
+        addr, length = struct.unpack('<2Q', value)
+        if (addr, length) != tuple(hfi):
+            raise ValueError('packed GPU-HFI entry differs from the requested range')
+        if any(overlap(addr, length, a, s) for a, s in intervals):
+            raise ValueError('GPU-HFI overlaps a firmware allocation')
     return len(image), MAX_PAYLOAD_SIZE - len(image)
 
 
